@@ -1,0 +1,78 @@
+# Signs the checksums of a `decypher` CLI release.
+#
+# The release workflow of the (private) source repository builds the five binaries and the SBOM, writes SHA256SUMS over them and uploads
+# everything to a DRAFT release `decypher-v<version>` of this repository, then triggers this workflow with a repository_dispatch (or a person
+# runs it by hand). This workflow
+#   1. downloads the assets of the draft release (release assets, not workflow artifacts),
+#   2. checks that SHA256SUMS lists exactly the files present, that every file matches and that all five platforms are there,
+#   3. signs SHA256SUMS keyless with Sigstore (the identity is this workflow on this branch) and verifies the signature again,
+#   4. uploads SHA256SUMS.sigstore.json to the same release.
+# Publishing the draft stays a separate step, after the signature has been verified.
+name: Sign CLI release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version of the draft release decypher-v<version> (for example 2.0.0)"
+        required: true
+  repository_dispatch:
+    types: [sign-cli]
+
+permissions: {}
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write   # keyless Sigstore signing
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version || github.event.client_payload.version }}
+    steps:
+      - name: Check the version
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version must look like 2.0.0"; exit 1; }
+      - name: Download the assets of the draft release
+        run: |
+          set -euo pipefail
+          id="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq ".[] | select(.tag_name == \"decypher-v$VERSION\") | .id" | head -1)"
+          [ -n "$id" ] || { echo "no release decypher-v$VERSION"; exit 1; }
+          echo "RELEASE_ID=$id" >> "$GITHUB_ENV"
+          mkdir dist
+          gh api "repos/$GITHUB_REPOSITORY/releases/$id/assets" --paginate --jq '.[] | "\(.id) \(.name)"' | while read -r aid name; do
+            gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$aid" > "dist/$name"
+          done
+          ls -l dist
+      - name: Check SHA256SUMS against the files
+        run: |
+          set -euo pipefail
+          cd dist
+          [ -f SHA256SUMS ] || { echo "no SHA256SUMS"; exit 1; }
+          [ ! -e SHA256SUMS.sigstore.json ] || { echo "SHA256SUMS.sigstore.json is already there"; exit 1; }
+          sha256sum -c SHA256SUMS
+          # exactly the files that are present (except the checksum file itself) are listed
+          diff <(awk '{print $2}' SHA256SUMS | sed 's/^\*//' | sort) <(ls | grep -v '^SHA256SUMS$' | sort)
+          for p in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do [ -f "decypher-$p" ] || { echo "missing decypher-$p"; exit 1; }; done
+          [ -f decypher-windows-amd64.exe ] || { echo "missing decypher-windows-amd64.exe"; exit 1; }
+          [ -f "decypher-$VERSION.cdx.json" ] || { echo "missing the SBOM"; exit 1; }
+          cat SHA256SUMS
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign the checksum file
+        run: |
+          cd dist
+          cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+      - name: Verify what was signed (identity = this workflow on this branch)
+        run: |
+          cd dist
+          cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/sign-cli.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: Attach the Sigstore bundle to the draft release
+        run: |
+          cd dist
+          gh api --method POST -H "Content-Type: application/octet-stream" \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=SHA256SUMS.sigstore.json" \
+            --input SHA256SUMS.sigstore.json --jq '.name + " uploaded"'
