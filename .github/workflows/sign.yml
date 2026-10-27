@@ -1,0 +1,83 @@
+# Signs the checksums of a Decypher JVM runtime release.
+#
+# The archives are built outside GitHub Actions (jlink on the target platform) and uploaded to a DRAFT release `v<version>` of this
+# repository together with one `<archive>.sha256.part` line per archive and the CycloneDX SBOM. This workflow
+#   1. downloads those assets from the release (release assets, not workflow artifacts),
+#   2. checks that every archive still matches its .part line and that no platform is listed twice,
+#   3. combines the lines into `decypher-jvm-<version>.sha256` (the SBOM is covered too),
+#   4. signs that file keyless with Sigstore (the identity is this workflow on this branch) and verifies the signature again,
+#   5. uploads the checksum file and the Sigstore bundle to the same release.
+# Publishing the draft stays a manual step after the signature has been verified.
+name: Sign runtime release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Runtime version of the draft release v<version> (for example 2.0.0)"
+        required: true
+
+permissions: {}
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write   # keyless Sigstore signing
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Check the version
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version must look like 2.0.0"; exit 1; }
+      - name: Download the assets of the draft release
+        run: |
+          set -euo pipefail
+          id="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq ".[] | select(.tag_name == \"v$VERSION\") | .id" | head -1)"
+          [ -n "$id" ] || { echo "no release v$VERSION"; exit 1; }
+          echo "RELEASE_ID=$id" >> "$GITHUB_ENV"
+          mkdir dist
+          gh api "repos/$GITHUB_REPOSITORY/releases/$id/assets" --paginate --jq '.[] | "\(.id) \(.name)"' | while read -r aid name; do
+            gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$aid" > "dist/$name"
+          done
+          ls -l dist
+      - name: Combine the checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          shopt -s nullglob
+          parts=(decypher-jvm-"$VERSION"-*.sha256.part)
+          [ "${#parts[@]}" -ge 1 ] || { echo "no .sha256.part files"; exit 1; }
+          for p in "${parts[@]}"; do
+            [ "$(wc -l < "$p")" -eq 1 ] || { echo "$p must hold exactly one line"; exit 1; }
+            sha256sum -c "$p"   # the archive still has the digest that was recorded when it was built
+          done
+          cat "${parts[@]}" | sort -k2 > "decypher-jvm-$VERSION.sha256"
+          [ -z "$(awk '{print $2}' "decypher-jvm-$VERSION.sha256" | sed -E 's/.*-(darwin|linux|windows)-(amd64|arm64)\..*/\1-\2/' | sort | uniq -d)" ] || { echo "a platform is listed twice"; exit 1; }
+          rm "${parts[@]}"
+          sbom="decypher-jvm-$VERSION.cdx.json"
+          [ -f "$sbom" ] || { echo "missing $sbom"; exit 1; }
+          sha256sum "$sbom" >> "decypher-jvm-$VERSION.sha256"
+          cat "decypher-jvm-$VERSION.sha256"
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign the checksum file
+        run: |
+          cd dist
+          cosign sign-blob --yes --bundle "decypher-jvm-$VERSION.sha256.sigstore.json" "decypher-jvm-$VERSION.sha256"
+      - name: Verify what was signed (identity = this workflow on this branch)
+        run: |
+          cd dist
+          cosign verify-blob --bundle "decypher-jvm-$VERSION.sha256.sigstore.json" \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/sign.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com "decypher-jvm-$VERSION.sha256"
+          sha256sum -c "decypher-jvm-$VERSION.sha256"
+      - name: Attach the checksum file and the Sigstore bundle to the draft release
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in "decypher-jvm-$VERSION.sha256" "decypher-jvm-$VERSION.sha256.sigstore.json"; do
+            gh api --method POST -H "Content-Type: application/octet-stream" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$f" --input "$f" --jq '.name + " uploaded"'
+          done
